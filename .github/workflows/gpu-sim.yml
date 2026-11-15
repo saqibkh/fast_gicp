@@ -1,0 +1,87 @@
+name: GPU Simulator
+
+# Builds with BUILD_VGICP_CUDA=ON and runs the gtest binary (which the Docker
+# builds in build.yml only compile) on a simulated NVIDIA H100, using
+# https://github.com/pantheongpu/pantheonsim. The hosted runners have no GPU.
+# A simulator cannot reproduce hardware-specific behavior or timing, so this
+# complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ master ]
+    paths:
+      - "src/**"
+      - "include/**"
+      - "data/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (CUDA 12.6 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ git libpcl-dev libeigen3-dev libgtest-dev libboost-all-dev
+
+      # Only Eigen and nvbio are needed for the CUDA code.
+      - name: Fetch submodules
+        run: git submodule update --init --depth 1 thirdparty/Eigen thirdparty/nvbio
+
+      # The code was written for CUDA 11 and does not build as is with the
+      # thrust that ships with CUDA 12.6: two headers forward-declare thrust
+      # types, and nvbio uses thrust's removed *_universal_iterator_tag. This
+      # job patches them (nothing in the repository changes).
+      - name: Patch headers for the CUDA 12 thrust
+        run: |
+          perl -0pi -e 's/namespace thrust \{.*?\}  \/\/ namespace thrust\n/#include <thrust\/device_vector.h>\n#include <thrust\/pair.h>\n/s' \
+            include/fast_gicp/cuda/ndt_cuda.cuh include/fast_gicp/cuda/fast_vgicp_cuda.cuh
+          sed -i '/universal_iterator_tag/d' thirdparty/nvbio/nvbio/basic/iterator.h
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@a1b9d4237411f9b2b0e0bb895b4d83377f336a7b # v0.1.9
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "12.6"
+          library-path: 'false'
+
+      # CMakeLists.txt replaces CUDA_NVCC_FLAGS, so the arch flag is added with
+      # sed in this job only. compute_90 embeds PTX only, which the simulator
+      # runs. The simulator also needs a shared CUDA runtime.
+      - name: Configure
+        run: |
+          sed -i 's/"--expt-relaxed-constexpr"/"--expt-relaxed-constexpr -arch=compute_90"/' CMakeLists.txt
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_VGICP_CUDA=ON \
+            -DBUILD_test=ON \
+            -DBUILD_apps=OFF \
+            -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-12.6 \
+            -DCUDA_USE_STATIC_CUDA_RUNTIME=OFF
+
+      - name: Build
+        run: vgpu run --preload cmake --build build -j3
+
+      # The test returns early (and still passes) when a registration method is
+      # not compiled in, so fail the step if any test was skipped.
+      - name: Test
+        run: |
+          vgpu run ./build/gicp_test data 2>&1 | tee test.log
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q "SKIP TEST" test.log; then echo "a test was skipped"; exit 1; fi
